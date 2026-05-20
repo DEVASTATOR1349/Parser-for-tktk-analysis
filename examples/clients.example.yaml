@@ -1,0 +1,7 @@
+clients:
+  - _key: demo_client
+    name: Demo Client
+    spreadsheet_id: YOUR_GOOGLE_SHEET_ID
+    project_admin_sheet: Админка проекта
+    project_videos_sheet: База Данных видео по проекту
+    project_history_sheet: История проекта по дням
