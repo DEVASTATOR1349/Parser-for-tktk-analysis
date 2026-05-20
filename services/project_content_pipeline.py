@@ -748,7 +748,14 @@ async def fetch_tiktok_accounts_batch(accounts: list[tuple[str, int]]) -> dict[s
 
     apify_result = await _apify_run_with_meta(
         TIKTOK_APIFY_ACTOR_ID,
-        {"profiles": usernames, "resultsPerPage": batch_limit},
+        {
+            "profiles": usernames,
+            "resultsPerPage": batch_limit,
+            "shouldDownloadVideos": False,
+            "shouldDownloadCovers": False,
+            "shouldDownloadSubtitles": False,
+            "shouldDownloadSlideshowImages": False,
+        },
     )
 
     grouped_items: dict[str, list[dict[str, Any]]] = {url: [] for url, _ in unique_accounts}
@@ -1129,6 +1136,10 @@ async def fetch_tiktok_account(account_url: str, results_limit: int | None = Non
         {
             "profiles": [username],
             "resultsPerPage": limit,
+            "shouldDownloadVideos": False,
+            "shouldDownloadCovers": False,
+            "shouldDownloadSubtitles": False,
+            "shouldDownloadSlideshowImages": False,
         },
     )
     items = sorted(
