@@ -36,12 +36,15 @@ YOUTUBE_ACTOR_ID = os.getenv("APIFY_YOUTUBE_ACTOR_ID", "streamers~youtube-channe
 TIKTOK_APIFY_ACTOR_ID = os.getenv("SCOUT_TIKTOK_APIFY_ACTOR_ID", "clockworks~tiktok-profile-scraper")
 FACEBOOK_PAGE_APIFY_ACTOR_ID = os.getenv("SCOUT_FACEBOOK_PAGE_APIFY_ACTOR_ID", "apify~facebook-pages-scraper")
 FACEBOOK_POSTS_APIFY_ACTOR_ID = os.getenv("SCOUT_FACEBOOK_POSTS_APIFY_ACTOR_ID", "apify~facebook-posts-scraper")
+TIKTOK_POST_APIFY_ACTOR_ID = os.getenv("SCOUT_TIKTOK_POST_APIFY_ACTOR_ID", "clockworks~tiktok-scraper")
 INSTAGRAM_RESULTS_LIMIT = int(os.getenv("SCOUT_PROJECT_INSTAGRAM_RESULTS_LIMIT", "250"))
 INSTAGRAM_MAIN_SHEET_EXTRA_URLS_LIMIT = int(os.getenv("SCOUT_PROJECT_INSTAGRAM_MAIN_SHEET_EXTRA_URLS_LIMIT", "100"))
 YOUTUBE_RESULTS_LIMIT = int(os.getenv("SCOUT_PROJECT_YOUTUBE_RESULTS_LIMIT", "250"))
 YOUTUBE_SHORTS_RESULTS_LIMIT = int(os.getenv("SCOUT_PROJECT_YOUTUBE_SHORTS_RESULTS_LIMIT", str(YOUTUBE_RESULTS_LIMIT)))
 FULL_BACKFILL_RESULTS_LIMIT = int(os.getenv("SCOUT_PROJECT_FULL_BACKFILL_RESULTS_LIMIT", "5000"))
 INSTAGRAM_MAX_APIFY_RUNS_PER_CYCLE = int(os.getenv("SCOUT_PROJECT_MAX_APIFY_RUNS_PER_CYCLE", "5"))
+TIKTOK_MAX_APIFY_RUNS_PER_CYCLE = int(os.getenv("SCOUT_PROJECT_TIKTOK_MAX_APIFY_RUNS_PER_CYCLE", "3"))
+FACEBOOK_MAX_APIFY_RUNS_PER_CYCLE = int(os.getenv("SCOUT_PROJECT_FACEBOOK_MAX_APIFY_RUNS_PER_CYCLE", "3"))
 TIKTOK_RESULTS_LIMIT = int(os.getenv("SCOUT_PROJECT_TIKTOK_RESULTS_LIMIT", "200"))
 FACEBOOK_RESULTS_LIMIT = int(os.getenv("SCOUT_PROJECT_FACEBOOK_RESULTS_LIMIT", "200"))
 VK_RESULTS_LIMIT = int(os.getenv("SCOUT_PROJECT_VK_RESULTS_LIMIT", "500"))
@@ -691,6 +694,180 @@ async def fetch_instagram_accounts_batch(accounts: list[tuple[str, int]]) -> dic
         result[account_url] = {
             "followers": str(_parse_int(first.get("followersCount"))),
             "total_videos": str(_parse_int(first.get("postsCount"))),
+            "items": trimmed,
+        }
+    return result
+
+
+def build_tiktok_apify_batches(accounts: list[tuple[str, int]], max_runs: int | None = None) -> list[list[tuple[str, int]]]:
+    normalized: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for account_url, limit in accounts:
+        normalized_url = normalize_account_url(account_url, "tiktok")
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        normalized.append((normalized_url, max(1, int(limit or TIKTOK_RESULTS_LIMIT))))
+
+    if not normalized:
+        return []
+
+    runs = max(1, int(max_runs or TIKTOK_MAX_APIFY_RUNS_PER_CYCLE or 1))
+    runs = min(runs, len(normalized))
+    base = len(normalized) // runs
+    extra = len(normalized) % runs
+    batches: list[list[tuple[str, int]]] = []
+    cursor = 0
+    for idx in range(runs):
+        size = base + (1 if idx < extra else 0)
+        batch = normalized[cursor:cursor + size]
+        if batch:
+            batches.append(batch)
+        cursor += size
+    return batches
+
+
+async def fetch_tiktok_accounts_batch(accounts: list[tuple[str, int]]) -> dict[str, dict[str, Any]]:
+    if not accounts:
+        return {}
+
+    unique_accounts: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for account_url, limit in accounts:
+        normalized_url = normalize_account_url(account_url, "tiktok")
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        unique_accounts.append((normalized_url, max(1, int(limit or TIKTOK_RESULTS_LIMIT))))
+
+    batch_limit = max(limit for _, limit in unique_accounts)
+    usernames = [_tiktok_profile_name(url) for url, _ in unique_accounts]
+    usernames = [u for u in usernames if u]
+    if not usernames:
+        return {}
+
+    apify_result = await _apify_run_with_meta(
+        TIKTOK_APIFY_ACTOR_ID,
+        {"profiles": usernames, "resultsPerPage": batch_limit},
+    )
+
+    grouped_items: dict[str, list[dict[str, Any]]] = {url: [] for url, _ in unique_accounts}
+    for item in apify_result.get("items") or []:
+        author = item.get("authorMeta") or {}
+        author_name = (author.get("name") or author.get("uniqueId") or "").strip().lstrip("@").lower()
+        if author_name:
+            for account_url, _ in unique_accounts:
+                if (_tiktok_profile_name(account_url) or "").lower() == author_name:
+                    grouped_items[account_url].append(item)
+                    break
+
+    result: dict[str, dict[str, Any]] = {}
+    for account_url, limit in unique_accounts:
+        items = sorted(
+            grouped_items.get(account_url) or [],
+            key=lambda item: _parse_dt(item.get("createTimeISO") or item.get("createTime") or item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        trimmed = items[:limit]
+        first = trimmed[0] if trimmed else {}
+        author = first.get("authorMeta") or {}
+        followers = author.get("fans") or author.get("followers") or first.get("followersCount") or ""
+        result[account_url] = {
+            "followers": str(_parse_int(followers)),
+            "total_videos": str(len(trimmed)),
+            "items": trimmed,
+        }
+    return result
+
+
+def build_facebook_apify_batches(accounts: list[tuple[str, int]], max_runs: int | None = None) -> list[list[tuple[str, int]]]:
+    normalized: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for account_url, limit in accounts:
+        normalized_url = normalize_account_url(account_url, "facebook")
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        normalized.append((normalized_url, max(1, int(limit or FACEBOOK_RESULTS_LIMIT))))
+
+    if not normalized:
+        return []
+
+    runs = max(1, int(max_runs or FACEBOOK_MAX_APIFY_RUNS_PER_CYCLE or 1))
+    runs = min(runs, len(normalized))
+    base = len(normalized) // runs
+    extra = len(normalized) % runs
+    batches: list[list[tuple[str, int]]] = []
+    cursor = 0
+    for idx in range(runs):
+        size = base + (1 if idx < extra else 0)
+        batch = normalized[cursor:cursor + size]
+        if batch:
+            batches.append(batch)
+        cursor += size
+    return batches
+
+
+async def fetch_facebook_accounts_batch(accounts: list[tuple[str, int]]) -> dict[str, dict[str, Any]]:
+    if not accounts:
+        return {}
+
+    unique_accounts: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for account_url, limit in accounts:
+        normalized_url = normalize_account_url(account_url, "facebook")
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        unique_accounts.append((normalized_url, max(1, int(limit or FACEBOOK_RESULTS_LIMIT))))
+
+    batch_limit = max(limit for _, limit in unique_accounts)
+
+    page_items = await _apify_run(
+        FACEBOOK_PAGE_APIFY_ACTOR_ID,
+        {
+            "startUrls": [{"url": url} for url, _ in unique_accounts],
+            "resultsLimit": len(unique_accounts),
+        },
+    )
+    post_items = await _apify_run(
+        FACEBOOK_POSTS_APIFY_ACTOR_ID,
+        {
+            "startUrls": [{"url": url} for url, _ in unique_accounts],
+            "resultsLimit": batch_limit * len(unique_accounts),
+        },
+    )
+
+    page_by_url: dict[str, dict] = {}
+    for item in page_items:
+        item_url = (item.get("url") or item.get("pageUrl") or "").rstrip("/")
+        for acc_url, _ in unique_accounts:
+            if acc_url.rstrip("/") == item_url or acc_url.rstrip("/") in item_url:
+                page_by_url[acc_url] = item
+                break
+
+    grouped_posts: dict[str, list[dict]] = {url: [] for url, _ in unique_accounts}
+    for item in post_items:
+        if not bool(item.get("isVideo")):
+            continue
+        item_url = (item.get("pageUrl") or item.get("pageProfileUrl") or item.get("url") or "").rstrip("/")
+        for acc_url, _ in unique_accounts:
+            if acc_url.rstrip("/") == item_url or acc_url.rstrip("/") in item_url:
+                grouped_posts[acc_url].append(item)
+                break
+
+    result: dict[str, dict[str, Any]] = {}
+    for account_url, limit in unique_accounts:
+        items = sorted(
+            grouped_posts.get(account_url) or [],
+            key=lambda item: _parse_dt(item.get("time") or item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        trimmed = items[:limit]
+        page_info = page_by_url.get(account_url) or {}
+        result[account_url] = {
+            "followers": str(_parse_int(page_info.get("followers") or page_info.get("likes") or "")),
+            "total_videos": str(len(trimmed)),
             "items": trimmed,
         }
     return result
@@ -1827,6 +2004,8 @@ async def sync_project_account(
     *,
     forced_video_urls: list[str] | None = None,
     prefetched_instagram_payload: dict[str, Any] | None = None,
+    prefetched_tiktok_payload: dict[str, Any] | None = None,
+    prefetched_facebook_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     imported_at = _now_str()
     sync_mode = "full_backfill" if _needs_full_backfill(account) else "incremental"
@@ -1862,10 +2041,10 @@ async def sync_project_account(
         payload = await fetch_youtube_account(account.account_url, results_limit=limit)
         mapper = map_youtube_item
     elif account.platform == "tiktok":
-        payload = await fetch_tiktok_account(account.account_url, results_limit=limit)
+        payload = prefetched_tiktok_payload if prefetched_tiktok_payload is not None else await fetch_tiktok_account(account.account_url, results_limit=limit)
         mapper = map_tiktok_item
     elif account.platform == "facebook":
-        payload = await fetch_facebook_account(account.account_url, results_limit=limit)
+        payload = prefetched_facebook_payload if prefetched_facebook_payload is not None else await fetch_facebook_account(account.account_url, results_limit=limit)
         mapper = map_facebook_item
     elif account.platform == "vk":
         payload = await fetch_vk_account(account.account_url, results_limit=limit)

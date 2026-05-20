@@ -1,15 +1,12 @@
 .env
 .env.*
-!.env.example
 *.json
 !package*.json
+config/
 __pycache__/
 *.pyc
 .venv/
 venv/
-node_modules/
-dist/
-build/
-clients.yaml
 logs/
 *.log
+.git/
