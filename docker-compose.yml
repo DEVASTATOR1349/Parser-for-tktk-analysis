@@ -14,7 +14,8 @@ services:
     env_file: .env
     volumes:
       - ./config:/app/config:ro
-    command: python workers/project_content_daily_worker.py --once
+    entrypoint: ["python", "workers/project_content_daily_worker.py", "--once"]
+    command: []
     restart: "no"
 
   refresh-worker:
@@ -22,5 +23,6 @@ services:
     env_file: .env
     volumes:
       - ./config:/app/config:ro
-    command: python workers/video_refresh_worker.py --once --max-rows 50
+    entrypoint: ["python", "workers/video_refresh_worker.py", "--once"]
+    command: ["--max-rows", "50"]
     restart: "no"
