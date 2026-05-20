@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +80,47 @@ def is_triggered(value: Any) -> bool:
     return val in ("true", "1", "да", "yes", "✓", "✔", "+", "on", "вкл", "включено")
 
 
+def load_clients_from_sheet(master_sheet_id: str) -> list[dict]:
+    """Load clients from the 'Клиенты' sheet in the master registry spreadsheet."""
+    gc = get_client()
+    sh = gc.open_by_key(master_sheet_id)
+    ws = sh.worksheet("Клиенты")
+    rows = ws.get_all_values()
+
+    # Find header row (first row where col A == '#')
+    header_idx = next((i for i, r in enumerate(rows) if r and r[0].strip() == "#"), 1)
+
+    clients: list[dict] = []
+    for row in rows[header_idx + 1:]:
+        if not row or not (row[0].strip().isdigit()):
+            continue
+        name = row[1].strip() if len(row) > 1 else ""
+        url = row[18].strip() if len(row) > 18 else ""
+        if not name or not url:
+            continue
+        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+        if not m:
+            continue
+        row_num = row[0].strip()
+        key = f"client_{row_num}"
+        clients.append({
+            "_key": key,
+            "name": name,
+            "spreadsheet_id": m.group(1),
+            "project_admin_sheet": "Админка проекта",
+            "project_videos_sheet": "База Данных видео по проекту",
+            "project_history_sheet": "История проекта по дням",
+        })
+    log.info("Loaded %s clients from master sheet %s", len(clients), master_sheet_id)
+    return clients
+
+
 def load_clients_config(path: str | None = None) -> list[dict]:
-    """Load clients list from YAML config file."""
+    """Load clients from master Google Sheet (CLIENTS_SHEET_ID) or fall back to YAML."""
+    sheet_id = os.getenv("CLIENTS_SHEET_ID", "").strip()
+    if sheet_id:
+        return load_clients_from_sheet(sheet_id)
+
     config_path = path or os.getenv("CLIENTS_CONFIG", "clients.yaml")
     config_file = Path(config_path)
     if not config_file.is_absolute():

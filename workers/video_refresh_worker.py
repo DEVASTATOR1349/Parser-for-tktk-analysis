@@ -196,8 +196,7 @@ def _write_row_updates(videos_ws, updates: list[dict]) -> None:
 def _append_history(history_ws, rows: list[list]) -> None:
     if not rows:
         return
-    for row in rows:
-        _sheet_call(history_ws.append_row, row, value_input_option="USER_ENTERED")
+    _sheet_call(history_ws.append_rows, rows, value_input_option="USER_ENTERED")
 
 
 async def refresh_client(client_config: dict, max_rows: int = DEFAULT_MAX_ROWS) -> dict:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import logging
 import sys
 from dataclasses import dataclass
@@ -217,6 +218,9 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
             ",".join(summary["statuses"]),
         )
         results.append(summary)
+        # Brief pause between clients to stay within Sheets API quota (300 req/min)
+        if len(contexts) > 1:
+            await asyncio.sleep(int(os.getenv("SCOUT_INTER_CLIENT_DELAY_SEC", "3")))
 
     return results
 
