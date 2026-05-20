@@ -823,13 +823,7 @@ async def fetch_facebook_accounts_batch(accounts: list[tuple[str, int]]) -> dict
 
     batch_limit = max(limit for _, limit in unique_accounts)
 
-    page_items = await _apify_run(
-        FACEBOOK_PAGE_APIFY_ACTOR_ID,
-        {
-            "startUrls": [{"url": url} for url, _ in unique_accounts],
-            "resultsLimit": len(unique_accounts),
-        },
-    )
+    # Single Apify run for all Facebook accounts — Posts scraper only
     post_items = await _apify_run(
         FACEBOOK_POSTS_APIFY_ACTOR_ID,
         {
@@ -837,14 +831,6 @@ async def fetch_facebook_accounts_batch(accounts: list[tuple[str, int]]) -> dict
             "resultsLimit": batch_limit * len(unique_accounts),
         },
     )
-
-    page_by_url: dict[str, dict] = {}
-    for item in page_items:
-        item_url = (item.get("url") or item.get("pageUrl") or "").rstrip("/")
-        for acc_url, _ in unique_accounts:
-            if acc_url.rstrip("/") == item_url or acc_url.rstrip("/") in item_url:
-                page_by_url[acc_url] = item
-                break
 
     grouped_posts: dict[str, list[dict]] = {url: [] for url, _ in unique_accounts}
     for item in post_items:
@@ -864,9 +850,10 @@ async def fetch_facebook_accounts_batch(accounts: list[tuple[str, int]]) -> dict
             reverse=True,
         )
         trimmed = items[:limit]
-        page_info = page_by_url.get(account_url) or {}
+        first = (post_items[0] if post_items else {})
+        followers = _parse_int(first.get("pageFollowers") or first.get("pageLikes") or first.get("likes") or "")
         result[account_url] = {
-            "followers": str(_parse_int(page_info.get("followers") or page_info.get("likes") or "")),
+            "followers": str(followers),
             "total_videos": str(len(trimmed)),
             "items": trimmed,
         }
@@ -1162,13 +1149,6 @@ async def fetch_tiktok_account(account_url: str, results_limit: int | None = Non
 async def fetch_facebook_account(account_url: str, results_limit: int | None = None) -> dict[str, Any]:
     _load_extra_env()
     limit = max(1, min(int(results_limit if results_limit is not None else FACEBOOK_RESULTS_LIMIT), 500))
-    page_items = await _apify_run(
-        FACEBOOK_PAGE_APIFY_ACTOR_ID,
-        {
-            "startUrls": [{"url": account_url}],
-            "resultsLimit": 1,
-        },
-    )
     post_items = await _apify_run(
         FACEBOOK_POSTS_APIFY_ACTOR_ID,
         {
@@ -1182,9 +1162,10 @@ async def fetch_facebook_account(account_url: str, results_limit: int | None = N
         key=lambda item: _parse_dt(item.get("time") or item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    first = page_items[0] if page_items else {}
+    first = post_items[0] if post_items else {}
+    followers = _parse_int(first.get("pageFollowers") or first.get("pageLikes") or first.get("likes") or "")
     return {
-        "followers": str(_parse_int(first.get("followers") or first.get("likes") or "")),
+        "followers": str(followers),
         "total_videos": str(len(items)),
         "items": items,
     }
