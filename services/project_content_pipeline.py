@@ -648,6 +648,10 @@ def build_instagram_apify_batches(accounts: list[tuple[str, int]], max_runs: int
 
 
 async def fetch_instagram_accounts_batch(accounts: list[tuple[str, int]]) -> dict[str, dict[str, Any]]:
+    """
+    Fetch Instagram accounts grouped by limit tier so low-limit accounts
+    don't pay for high-limit resultsPerPage meant for full-backfill accounts.
+    """
     if not accounts:
         return {}
 
@@ -660,45 +664,59 @@ async def fetch_instagram_accounts_batch(accounts: list[tuple[str, int]]) -> dic
         seen.add(normalized_url)
         unique_accounts.append((normalized_url, max(1, int(limit or INSTAGRAM_RESULTS_LIMIT))))
 
-    # Use the largest requested limit so all accounts get their needed results
-    batch_limit = max(limit for _, limit in unique_accounts)
-    # For big differences in limits, fetch more and trim later; the actor
-    # returns all results up to resultsLimit, we group per-account below.
-    payload = {
-        "username": [account_url for account_url, _ in unique_accounts],
-        "resultsLimit": batch_limit * len(unique_accounts),
-        "skipPinnedPosts": True,
-        "includeSharesCount": False,
-        "includeTranscript": False,
-        "includeDownloadedVideo": False,
-    }
-    apify_result = await _apify_run_with_meta(INSTAGRAM_REEL_ACTOR_ID, payload)
-    grouped_items: dict[str, list[dict[str, Any]]] = {account_url: [] for account_url, _ in unique_accounts}
-    for item in apify_result.get("items") or []:
-        input_url = normalize_account_url(str(item.get("inputUrl") or item.get("ownerProfilePicUrl") or "").strip(), "instagram") if str(item.get("inputUrl") or "").strip() else ""
-        if input_url and input_url in grouped_items:
-            grouped_items[input_url].append(item)
-            continue
-        owner_username = str(item.get("ownerUsername") or item.get("username") or "").strip().lstrip("@")
-        if owner_username:
-            fallback_url = normalize_account_url(owner_username, "instagram")
-            if fallback_url in grouped_items:
-                grouped_items[fallback_url].append(item)
+    # Group by requested limit
+    limit_groups: dict[int, list[tuple[str, int]]] = {}
+    for entry in unique_accounts:
+        url, limit = entry
+        limit_groups.setdefault(limit, []).append(entry)
 
     result: dict[str, dict[str, Any]] = {}
-    for account_url, limit in unique_accounts:
-        items = sorted(
-            grouped_items.get(account_url) or [],
-            key=lambda item: _parse_dt(item.get("timestamp") or item.get("takenAtTimestamp") or item.get("publishedAt")) or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
+
+    for group_limit, group_accounts in limit_groups.items():
+        log.info(
+            "Instagram batch group: limit=%s accounts=%s",
+            group_limit, len(group_accounts),
         )
-        trimmed = items[:limit]
-        first = trimmed[0] if trimmed else {}
-        result[account_url] = {
-            "followers": str(_parse_int(first.get("followersCount"))),
-            "total_videos": str(_parse_int(first.get("postsCount"))),
-            "items": trimmed,
+        payload = {
+            "username": [url for url, _ in group_accounts],
+            "resultsLimit": group_limit * len(group_accounts),
+            "skipPinnedPosts": True,
+            "includeSharesCount": False,
+            "includeTranscript": False,
+            "includeDownloadedVideo": False,
         }
+        apify_result = await _apify_run_with_meta(INSTAGRAM_REEL_ACTOR_ID, payload)
+
+        grouped_items: dict[str, list[dict[str, Any]]] = {url: [] for url, _ in group_accounts}
+        for item in apify_result.get("items") or []:
+            input_url = normalize_account_url(
+                str(item.get("inputUrl") or item.get("ownerProfilePicUrl") or "").strip(), "instagram"
+            ) if str(item.get("inputUrl") or "").strip() else ""
+            if input_url and input_url in grouped_items:
+                grouped_items[input_url].append(item)
+                continue
+            owner_username = str(item.get("ownerUsername") or item.get("username") or "").strip().lstrip("@")
+            if owner_username:
+                fallback_url = normalize_account_url(owner_username, "instagram")
+                if fallback_url in grouped_items:
+                    grouped_items[fallback_url].append(item)
+
+        for account_url, limit in group_accounts:
+            items = sorted(
+                grouped_items.get(account_url) or [],
+                key=lambda item: _parse_dt(
+                    item.get("timestamp") or item.get("takenAtTimestamp") or item.get("publishedAt")
+                ) or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            trimmed = items[:limit]
+            first = trimmed[0] if trimmed else {}
+            result[account_url] = {
+                "followers": str(_parse_int(first.get("followersCount"))),
+                "total_videos": str(_parse_int(first.get("postsCount"))),
+                "items": trimmed,
+            }
+
     return result
 
 
@@ -731,6 +749,15 @@ def build_tiktok_apify_batches(accounts: list[tuple[str, int]], max_runs: int | 
 
 
 async def fetch_tiktok_accounts_batch(accounts: list[tuple[str, int]]) -> dict[str, dict[str, Any]]:
+    """
+    Fetch TikTok account data in batches grouped by limit tier.
+
+    Groups accounts by their requested limit so that low-limit accounts
+    (e.g. incremental, ~200 posts) don't pay for a high-limit resultsPerPage
+    that full-backfill accounts (e.g. 5000 posts) need.
+
+    Each group gets its own Apify run with the appropriate resultsPerPage.
+    """
     if not accounts:
         return {}
 
@@ -743,53 +770,66 @@ async def fetch_tiktok_accounts_batch(accounts: list[tuple[str, int]]) -> dict[s
         seen.add(normalized_url)
         unique_accounts.append((normalized_url, max(1, int(limit or TIKTOK_RESULTS_LIMIT))))
 
-    batch_limit = max(limit for _, limit in unique_accounts)
-    # resultsPerPage is per-profile, so the max limit ensures every account
-    # gets at least that many results. Accounts needing fewer are trimmed below.
-
-    usernames = [_tiktok_profile_name(url) for url, _ in unique_accounts]
-    usernames = [u for u in usernames if u]
-    if not usernames:
-        return {}
-
-    apify_result = await _apify_run_with_meta(
-        TIKTOK_APIFY_ACTOR_ID,
-        {
-            "profiles": usernames,
-            "resultsPerPage": batch_limit,
-            "shouldDownloadVideos": False,
-            "shouldDownloadCovers": False,
-            "shouldDownloadSubtitles": False,
-            "shouldDownloadSlideshowImages": False,
-        },
-    )
-
-    grouped_items: dict[str, list[dict[str, Any]]] = {url: [] for url, _ in unique_accounts}
-    for item in apify_result.get("items") or []:
-        author = item.get("authorMeta") or {}
-        author_name = (author.get("name") or author.get("uniqueId") or "").strip().lstrip("@").lower()
-        if author_name:
-            for account_url, _ in unique_accounts:
-                if (_tiktok_profile_name(account_url) or "").lower() == author_name:
-                    grouped_items[account_url].append(item)
-                    break
+    # Group accounts by their requested limit value
+    limit_groups: dict[int, list[tuple[str, int]]] = {}
+    for entry in unique_accounts:
+        url, limit = entry
+        limit_groups.setdefault(limit, []).append(entry)
 
     result: dict[str, dict[str, Any]] = {}
-    for account_url, limit in unique_accounts:
-        items = sorted(
-            grouped_items.get(account_url) or [],
-            key=lambda item: _parse_dt(item.get("createTimeISO") or item.get("createTime") or item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
+
+    for group_limit, group_accounts in limit_groups.items():
+        usernames = [_tiktok_profile_name(url) for url, _ in group_accounts]
+        usernames = [u for u in usernames if u]
+        if not usernames:
+            continue
+
+        log.info(
+            "TikTok batch group: limit=%s accounts=%s profiles=%s",
+            group_limit, len(group_accounts), len(usernames),
         )
-        trimmed = items[:limit]
-        first = trimmed[0] if trimmed else {}
-        author = first.get("authorMeta") or {}
-        followers = author.get("fans") or author.get("followers") or first.get("followersCount") or ""
-        result[account_url] = {
-            "followers": str(_parse_int(followers)),
-            "total_videos": str(len(trimmed)),
-            "items": trimmed,
-        }
+
+        apify_result = await _apify_run_with_meta(
+            TIKTOK_APIFY_ACTOR_ID,
+            {
+                "profiles": usernames,
+                "resultsPerPage": group_limit,
+                "shouldDownloadVideos": False,
+                "shouldDownloadCovers": False,
+                "shouldDownloadSubtitles": False,
+                "shouldDownloadSlideshowImages": False,
+            },
+        )
+
+        # Group fetched items by account URL
+        grouped_items: dict[str, list[dict[str, Any]]] = {url: [] for url, _ in group_accounts}
+        for item in apify_result.get("items") or []:
+            author = item.get("authorMeta") or {}
+            author_name = (author.get("name") or author.get("uniqueId") or "").strip().lstrip("@").lower()
+            if author_name:
+                for account_url, _ in group_accounts:
+                    if (_tiktok_profile_name(account_url) or "").lower() == author_name:
+                        grouped_items[account_url].append(item)
+                        break
+
+        for account_url, limit in group_accounts:
+            items = sorted(
+                grouped_items.get(account_url) or [],
+                key=lambda item: _parse_dt(
+                    item.get("createTimeISO") or item.get("createTime") or item.get("timestamp")
+                ) or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            trimmed = items[:limit]
+            first = trimmed[0] if trimmed else {}
+            author = first.get("authorMeta") or {}
+            followers = author.get("fans") or author.get("followers") or first.get("followersCount") or ""
+            result[account_url] = {
+                "followers": str(_parse_int(followers)),
+                "total_videos": str(len(trimmed)),
+                "items": trimmed,
+            }
+
     return result
 
 
@@ -822,6 +862,10 @@ def build_facebook_apify_batches(accounts: list[tuple[str, int]], max_runs: int 
 
 
 async def fetch_facebook_accounts_batch(accounts: list[tuple[str, int]]) -> dict[str, dict[str, Any]]:
+    """
+    Fetch Facebook accounts grouped by limit tier so low-limit accounts
+    don't pay for high-limit resultsLimit meant for full-backfill accounts.
+    """
     if not accounts:
         return {}
 
@@ -834,42 +878,53 @@ async def fetch_facebook_accounts_batch(accounts: list[tuple[str, int]]) -> dict
         seen.add(normalized_url)
         unique_accounts.append((normalized_url, max(1, int(limit or FACEBOOK_RESULTS_LIMIT))))
 
-    batch_limit = max(limit for _, limit in unique_accounts)
-
-    # Single Apify run for all Facebook accounts — Posts scraper only
-    post_items = await _apify_run(
-        FACEBOOK_POSTS_APIFY_ACTOR_ID,
-        {
-            "startUrls": [{"url": url} for url, _ in unique_accounts],
-            "resultsLimit": batch_limit * len(unique_accounts),
-        },
-    )
-
-    grouped_posts: dict[str, list[dict]] = {url: [] for url, _ in unique_accounts}
-    for item in post_items:
-        if not bool(item.get("isVideo")):
-            continue
-        item_url = (item.get("pageUrl") or item.get("pageProfileUrl") or item.get("url") or "").rstrip("/")
-        for acc_url, _ in unique_accounts:
-            if acc_url.rstrip("/") == item_url or acc_url.rstrip("/") in item_url:
-                grouped_posts[acc_url].append(item)
-                break
+    # Group by requested limit
+    limit_groups: dict[int, list[tuple[str, int]]] = {}
+    for entry in unique_accounts:
+        url, limit = entry
+        limit_groups.setdefault(limit, []).append(entry)
 
     result: dict[str, dict[str, Any]] = {}
-    for account_url, limit in unique_accounts:
-        items = sorted(
-            grouped_posts.get(account_url) or [],
-            key=lambda item: _parse_dt(item.get("time") or item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
+
+    for group_limit, group_accounts in limit_groups.items():
+        log.info(
+            "Facebook batch group: limit=%s accounts=%s",
+            group_limit, len(group_accounts),
         )
-        trimmed = items[:limit]
-        first = (post_items[0] if post_items else {})
-        followers = _parse_int(first.get("pageFollowers") or first.get("pageLikes") or first.get("likes") or "")
-        result[account_url] = {
-            "followers": str(followers),
-            "total_videos": str(len(trimmed)),
-            "items": trimmed,
-        }
+
+        post_items = await _apify_run(
+            FACEBOOK_POSTS_APIFY_ACTOR_ID,
+            {
+                "startUrls": [{"url": url} for url, _ in group_accounts],
+                "resultsLimit": group_limit * len(group_accounts),
+            },
+        )
+
+        grouped_posts: dict[str, list[dict]] = {url: [] for url, _ in group_accounts}
+        for item in post_items:
+            if not bool(item.get("isVideo")):
+                continue
+            item_url = (item.get("pageUrl") or item.get("pageProfileUrl") or item.get("url") or "").rstrip("/")
+            for acc_url, _ in group_accounts:
+                if acc_url.rstrip("/") == item_url or acc_url.rstrip("/") in item_url:
+                    grouped_posts[acc_url].append(item)
+                    break
+
+        for account_url, limit in group_accounts:
+            items = sorted(
+                grouped_posts.get(account_url) or [],
+                key=lambda item: _parse_dt(item.get("time") or item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            trimmed = items[:limit]
+            first = (post_items[0] if post_items else {})
+            followers = _parse_int(first.get("pageFollowers") or first.get("pageLikes") or first.get("likes") or "")
+            result[account_url] = {
+                "followers": str(followers),
+                "total_videos": str(len(trimmed)),
+                "items": trimmed,
+            }
+
     return result
 
 
