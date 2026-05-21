@@ -29,14 +29,8 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from services.project_content_pipeline import (
-    INSTAGRAM_MAX_APIFY_RUNS_PER_CYCLE,
-    TIKTOK_MAX_APIFY_RUNS_PER_CYCLE,
-    FACEBOOK_MAX_APIFY_RUNS_PER_CYCLE,
-    build_instagram_apify_batches,
     fetch_instagram_accounts_batch,
-    build_tiktok_apify_batches,
     fetch_tiktok_accounts_batch,
-    build_facebook_apify_batches,
     fetch_facebook_accounts_batch,
     get_project_sheets,
     read_admin_rows,
@@ -102,7 +96,7 @@ async def _load_contexts(client_key: str | None = None) -> list[ClientContext]:
     return contexts
 
 
-async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRAM_MAX_APIFY_RUNS_PER_CYCLE, platform_filter: str | None = None) -> list[dict]:
+async def run_once(client_key: str | None = None, max_apify_runs: int = 1, platform_filter: str | None = None) -> list[dict]:
     contexts = await _load_contexts(client_key)
 
     instagram_accounts: list[tuple[str, int]] = []
@@ -119,40 +113,35 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
             elif account.platform == "facebook":
                 facebook_accounts.append((account.account_url, _fetch_limit(account)))
 
+    # ONE Apify run per platform — all accounts together, single request
     prefetched_instagram: dict[str, dict] = {}
-    batches = build_instagram_apify_batches(instagram_accounts, max_runs=max_apify_runs)
-    for idx, batch in enumerate(batches, start=1):
-        log.info("Instagram batch %s/%s: %s accounts", idx, len(batches), len(batch))
+    if instagram_accounts:
+        log.info("Instagram: single batch with %s accounts", len(instagram_accounts))
         try:
-            batch_payload = await fetch_instagram_accounts_batch(batch)
-            prefetched_instagram.update(batch_payload)
-        except Exception as batch_exc:
-            log.warning("Instagram batch %s/%s failed (will retry per-account): %s", idx, len(batches), batch_exc)
-            for account_url, _ in batch:
+            prefetched_instagram = await fetch_instagram_accounts_batch(instagram_accounts)
+        except Exception as exc:
+            log.warning("Instagram single batch failed: %s", exc)
+            for account_url, _ in instagram_accounts:
                 prefetched_instagram[account_url] = None
 
     prefetched_tiktok: dict[str, dict] = {}
-    tiktok_batches = build_tiktok_apify_batches(tiktok_accounts, max_runs=TIKTOK_MAX_APIFY_RUNS_PER_CYCLE)
-    for idx, batch in enumerate(tiktok_batches, start=1):
-        log.info("TikTok batch %s/%s: %s accounts", idx, len(tiktok_batches), len(batch))
+    if tiktok_accounts:
+        log.info("TikTok: single batch with %s accounts", len(tiktok_accounts))
         try:
-            batch_payload = await fetch_tiktok_accounts_batch(batch)
-            prefetched_tiktok.update(batch_payload)
-        except Exception as batch_exc:
-            log.warning("TikTok batch %s/%s failed (will retry per-account): %s", idx, len(tiktok_batches), batch_exc)
-            for account_url, _ in batch:
+            prefetched_tiktok = await fetch_tiktok_accounts_batch(tiktok_accounts)
+        except Exception as exc:
+            log.warning("TikTok single batch failed: %s", exc)
+            for account_url, _ in tiktok_accounts:
                 prefetched_tiktok[account_url] = None
 
     prefetched_facebook: dict[str, dict] = {}
-    facebook_batches = build_facebook_apify_batches(facebook_accounts, max_runs=FACEBOOK_MAX_APIFY_RUNS_PER_CYCLE)
-    for idx, batch in enumerate(facebook_batches, start=1):
-        log.info("Facebook batch %s/%s: %s accounts", idx, len(facebook_batches), len(batch))
+    if facebook_accounts:
+        log.info("Facebook: single batch with %s accounts", len(facebook_accounts))
         try:
-            batch_payload = await fetch_facebook_accounts_batch(batch)
-            prefetched_facebook.update(batch_payload)
-        except Exception as batch_exc:
-            log.warning("Facebook batch %s/%s failed (will retry per-account): %s", idx, len(facebook_batches), batch_exc)
-            for account_url, _ in batch:
+            prefetched_facebook = await fetch_facebook_accounts_batch(facebook_accounts)
+        except Exception as exc:
+            log.warning("Facebook single batch failed: %s", exc)
+            for account_url, _ in facebook_accounts:
                 prefetched_facebook[account_url] = None
 
     results: list[dict] = []
@@ -241,13 +230,12 @@ def main():
     parser = argparse.ArgumentParser(description="Daily project content sync worker with batched Instagram Apify runs")
     parser.add_argument("--client", help="Only run for one client key from clients.yaml")
     parser.add_argument("--once", action="store_true", help="Run one sync cycle and exit")
-    parser.add_argument("--max-apify-runs", type=int, default=INSTAGRAM_MAX_APIFY_RUNS_PER_CYCLE, help="Max Instagram Apify runs per cycle")
+    parser.add_argument("--max-apify-runs", type=int, default=1, help="Max Instagram Apify runs per cycle (legacy, kept for compat)")
     parser.add_argument("--test-limit", type=int, default=0, help="Limit videos fetched per account (for testing, e.g. --test-limit 3)")
     parser.add_argument("--platform", help="Only sync this platform (e.g. tiktok, instagram, youtube)")
     args = parser.parse_args()
 
     if args.test_limit > 0:
-        import os
         limit_str = str(args.test_limit)
         for var in (
             "SCOUT_PROJECT_INSTAGRAM_RESULTS_LIMIT",
@@ -259,7 +247,7 @@ def main():
             "SCOUT_PROJECT_FULL_BACKFILL_RESULTS_LIMIT",
         ):
             os.environ[var] = limit_str
-        log.info("Test mode: fetch limit = %s per account", args.test_limit)
+        log.info("Test mode: fetch limit = %s per account (os.environ updated for lazy reads)", args.test_limit)
 
     if args.once:
         asyncio.run(run_once(args.client, args.max_apify_runs, args.platform))
