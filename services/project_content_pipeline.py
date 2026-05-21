@@ -93,7 +93,7 @@ PLATFORM_ALIASES = {
     "likee": "likee",
 }
 
-DISABLED_PROJECT_PLATFORMS = {"pinterest", "likee", "dzen", "ok"}
+DISABLED_PROJECT_PLATFORMS = {"pinterest", "likee", "dzen", "ok", "tiktok"}
 
 UNSUPPORTED_PLATFORM_REASONS = {
     "dzen": "No stable public source for full project-owned video backfill in this runtime",
@@ -2355,6 +2355,475 @@ async def process_project_content_clients(client_key: str | None = None) -> list
             results.append({"client": client.get("name"), "error": str(exc)[:200]})
 
     return results
+
+
+def _find_next_row_from_data(data_rows: list[list], start_row: int = VIDEO_DATA_START_ROW) -> int:
+    """Given data from a batchGet starting at start_row, find the next row
+    after the last non-empty row in column A."""
+    for idx in range(len(data_rows) - 1, -1, -1):
+        row = data_rows[idx] or []
+        if row and str(row[0] if len(row) > 0 else "").strip():
+            return start_row + idx + 1
+    return start_row
+
+
+async def batched_sync_client(
+    client_config: dict,
+    sh,
+    prefetched_instagram: dict[str, dict] | None = None,
+    prefetched_facebook: dict[str, dict] | None = None,
+) -> dict[str, Any]:
+    """
+    Process a single client using 1 batchGet + 1 batchUpdate.
+
+    - Reads admin, videos, history, and main sheet in 1 batchGet.
+    - Processes all accounts in memory (Instagram/Facebook from prefetched
+      data, YouTube/VK/Rutube via direct API call).
+    - Deduplicates, collects admin updates, snapshot, and BM metrics.
+    - Writes everything in 1 batchUpdate.
+
+    TikTok is handled by the caller (disable in run_once or via
+    DISABLED_PROJECT_PLATFORMS).
+    """
+    client_name = client_config.get("name", "?")
+    main_sheet_name = client_config.get("sheet_name", "")
+
+    # --- 1. Build batchGet ranges ---
+    ranges: list[str] = [
+        f"'{DEFAULT_PROJECT_ADMIN_SHEET}'!A1:N9999",
+        f"'{DEFAULT_PROJECT_VIDEOS_SHEET}'!C{VIDEO_DATA_START_ROW}:D99999",
+        f"'{DEFAULT_PROJECT_VIDEOS_SHEET}'!A{VIDEO_DATA_START_ROW}:S99999",
+        f"'{DEFAULT_PROJECT_HISTORY_SHEET}'!A{HISTORY_DATA_START_ROW}:I99999",
+    ]
+    has_main_sheet = bool(main_sheet_name)
+    if has_main_sheet:
+        ranges.append(
+            f"'{main_sheet_name}'!BL{MAIN_SHEET_DATA_START_ROW}:BM99999"
+        )
+
+    # --- 2. batchGet (retry without main-sheet ranges if sheet missing) ---
+    try:
+        batch_result = _sheet_call(sh.values_batch_get, ranges)
+    except gspread.exceptions.APIError as e:
+        if has_main_sheet and ("not found" in str(e).lower()):
+            log.info(
+                "[%s] Main sheet '%s' not found, retrying without BL:BM",
+                client_name, main_sheet_name,
+            )
+            ranges = ranges[:4]
+            has_main_sheet = False
+            batch_result = _sheet_call(sh.values_batch_get, ranges)
+        else:
+            raise
+
+    value_ranges = batch_result.get("valueRanges", [])
+
+    def _vr(idx: int) -> list[list]:
+        return value_ranges[idx].get("values", []) if idx < len(value_ranges) else []
+
+    admin_data = _vr(0)
+    video_keys_data = _vr(1)
+    video_full_data = _vr(2)
+    history_data = _vr(3)
+    main_sheet_bl_bm_data = _vr(4) if has_main_sheet else []
+
+    # --- 3. Parse admin rows ---
+    master_enabled = False
+    accounts: list[ProjectAccountRow] = []
+    if len(admin_data) >= 2 and len(admin_data[1]) >= 2:
+        master_enabled = is_triggered(admin_data[1][1])
+
+    if not master_enabled:
+        log.info("[%s] project content sync skipped: B2 is off", client_name)
+        return {
+            "client": client_name,
+            "enabled": False,
+            "accounts": 0,
+            "new_videos": 0,
+            "statuses": [],
+        }
+
+    for row_idx_offset, row in enumerate(admin_data[1:], start=2):
+        url = (row[0] if len(row) > 0 else "").strip()
+        if not url:
+            continue
+        platform = canonical_platform_name(detect_platform(url))
+        if not platform or platform in DISABLED_PROJECT_PLATFORMS:
+            continue
+        accounts.append(ProjectAccountRow(
+            row_idx=row_idx_offset,
+            account_url=normalize_account_url(url, platform),
+            platform=platform,
+            followers=(row[2] if len(row) > 2 else "").strip(),
+            total_videos=(row[3] if len(row) > 3 else "").strip(),
+            last_checked_at=(row[4] if len(row) > 4 else "").strip(),
+            last_full_import_at=(row[5] if len(row) > 5 else "").strip(),
+            new_videos_count=(row[6] if len(row) > 6 else "").strip(),
+            status=(row[7] if len(row) > 7 else "").strip(),
+        ))
+
+    # --- 4. Parse existing video keys ---
+    existing_keys: set[tuple[str, str]] = set()
+    for row in video_keys_data:
+        plat = (row[0] if len(row) > 0 else "").strip().lower()
+        vid_url = (row[1] if len(row) > 1 else "").strip()
+        if not plat or not vid_url:
+            continue
+        canon_plat = canonical_platform_name(plat)
+        existing_keys.add((canon_plat, normalize_video_url(vid_url, canon_plat)))
+
+    rows_before = len(existing_keys)
+
+    # --- 5. Missing main sheet Instagram URLs ---
+    forced_video_urls: list[str] = extract_missing_main_sheet_instagram_urls(
+        main_sheet_bl_bm_data, existing_keys,
+    )
+
+    # --- 6. Build summary_map from existing video data ---
+    summary_map = build_project_video_summary_map(video_full_data)
+
+    # --- 7. Process each account ---
+    imported_at = _now_str()
+    statuses: list[str] = []
+    new_videos_total = 0
+    inserted_by_platform: dict[str, int] = {}
+    skipped_platforms: dict[str, str] = {}
+    incremental_support: dict[str, bool] = {}
+    snapshot = _empty_daily_snapshot()
+    all_new_records: list[ProjectVideoRecord] = []
+    admin_updates: list[dict] = []
+
+    for account in accounts:
+        try:
+            sync_mode = "full_backfill" if _needs_full_backfill(account) else "incremental"
+
+            if account.platform in UNSUPPORTED_PLATFORM_REASONS:
+                reason = UNSUPPORTED_PLATFORM_REASONS[account.platform]
+                status = f"SKIPPED: {reason[:100]}"
+                admin_updates.append({
+                    "row_idx": account.row_idx,
+                    "followers": account.followers,
+                    "total_videos": account.total_videos,
+                    "new_count": 0,
+                    "status": status,
+                    "full_import_at": "",
+                    "platform": account.platform,
+                })
+                statuses.append(f"{account.platform}:{status}")
+                skipped_platforms[account.platform] = reason
+                incremental_support[account.platform] = False
+                continue
+
+            payload = None
+            mapper = None
+            if account.platform == "instagram":
+                if prefetched_instagram is None:
+                    status = "SKIPPED: no prefetched data"
+                    admin_updates.append({
+                        "row_idx": account.row_idx,
+                        "followers": account.followers,
+                        "total_videos": account.total_videos,
+                        "new_count": 0,
+                        "status": status,
+                        "full_import_at": "",
+                        "platform": account.platform,
+                    })
+                    statuses.append(f"{account.platform}:{status}")
+                    continue
+                payload = prefetched_instagram.get(account.account_url)
+                mapper = map_instagram_item
+            elif account.platform == "facebook":
+                if prefetched_facebook is None:
+                    status = "SKIPPED: no prefetched data"
+                    admin_updates.append({
+                        "row_idx": account.row_idx,
+                        "followers": account.followers,
+                        "total_videos": account.total_videos,
+                        "new_count": 0,
+                        "status": status,
+                        "full_import_at": "",
+                        "platform": account.platform,
+                    })
+                    statuses.append(f"{account.platform}:{status}")
+                    continue
+                payload = prefetched_facebook.get(account.account_url)
+                mapper = map_facebook_item
+            elif account.platform == "youtube":
+                payload = await fetch_youtube_account(
+                    account.account_url,
+                    results_limit=_fetch_limit(account),
+                )
+                mapper = map_youtube_item
+            elif account.platform == "vk":
+                payload = await fetch_vk_account(
+                    account.account_url,
+                    results_limit=_fetch_limit(account),
+                )
+                mapper = map_vk_item
+            elif account.platform == "rutube":
+                payload = await fetch_rutube_account(
+                    account.account_url,
+                    results_limit=_fetch_limit(account),
+                )
+                mapper = map_rutube_item
+            else:
+                status = "UNSUPPORTED"
+                admin_updates.append({
+                    "row_idx": account.row_idx,
+                    "followers": account.followers,
+                    "total_videos": account.total_videos,
+                    "new_count": 0,
+                    "status": status,
+                    "full_import_at": "",
+                    "platform": account.platform,
+                })
+                statuses.append(f"{account.platform}:{status}")
+                incremental_support[account.platform] = False
+                continue
+
+            if payload is None:
+                status = "SKIPPED: no data returned"
+                admin_updates.append({
+                    "row_idx": account.row_idx,
+                    "followers": account.followers,
+                    "total_videos": account.total_videos,
+                    "new_count": 0,
+                    "status": status,
+                    "full_import_at": "",
+                    "platform": account.platform,
+                })
+                statuses.append(f"{account.platform}:{status}")
+                continue
+
+            followers = payload.get("followers", "")
+            total_videos = payload.get("total_videos", "")
+            incremental_floor = (
+                _incremental_since_msk() if sync_mode == "incremental" else None
+            )
+
+            forced_video_keys: set[tuple[str, str]] = set()
+            if account.platform == "instagram":
+                forced_video_keys = {
+                    ("instagram", normalize_video_url(url, "instagram"))
+                    for url in forced_video_urls
+                    if normalize_video_url(url, "instagram")
+                }
+
+            new_records: list[ProjectVideoRecord] = []
+            for item in payload.get("items", []):
+                rec = mapper(item, account.account_url, imported_at)
+                if not rec:
+                    continue
+                key = rec.unique_key()
+                published_dt = _parse_record_published_at(rec.published_at)
+                if (
+                    incremental_floor
+                    and key not in forced_video_keys
+                    and published_dt
+                    and published_dt.astimezone(MSK) < incremental_floor
+                ):
+                    continue
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                new_records.append(rec)
+
+            added = len(new_records)
+            all_new_records.extend(new_records)
+
+            full_import_at = imported_at if sync_mode == "full_backfill" else None
+            if sync_mode == "full_backfill":
+                status = "FULL_BACKFILL_DONE" if added else "FULL_BACKFILL_NO_NEW"
+            else:
+                status = "INCREMENTAL_SYNC" if added else "NO_CHANGES"
+
+            admin_updates.append({
+                "row_idx": account.row_idx,
+                "followers": str(followers),
+                "total_videos": str(total_videos),
+                "new_count": added,
+                "status": status,
+                "full_import_at": full_import_at or "",
+                "platform": account.platform,
+            })
+            statuses.append(f"{account.platform}:{status}")
+            new_videos_total += added
+            inserted_by_platform[account.platform] = (
+                inserted_by_platform.get(account.platform, 0) + added
+            )
+            incremental_support[account.platform] = True
+
+            if account.platform == "instagram":
+                snapshot.instagram_followers = str(followers)
+                snapshot.instagram_videos = str(total_videos)
+                snapshot.instagram_checked_at = imported_at
+                snapshot.instagram_status = status
+            elif account.platform == "youtube":
+                snapshot.youtube_followers = str(followers)
+                snapshot.youtube_videos = str(total_videos)
+                snapshot.youtube_checked_at = imported_at
+                snapshot.youtube_status = status
+        except Exception as exc:
+            status = f"ERROR: {str(exc)[:120]}"
+            admin_updates.append({
+                "row_idx": account.row_idx,
+                "followers": account.followers,
+                "total_videos": account.total_videos,
+                "new_count": 0,
+                "status": status,
+                "full_import_at": "",
+                "platform": account.platform,
+            })
+            statuses.append(f"{account.platform}:ERROR")
+            skipped_platforms[account.platform] = str(exc)[:200]
+            incremental_support[account.platform] = False
+            if account.platform == "instagram":
+                snapshot.instagram_status = status
+            elif account.platform == "youtube":
+                snapshot.youtube_status = status
+            log.exception(
+                "[%s] project sync failed for row %s: %s",
+                client_name, account.row_idx, exc,
+            )
+
+    # --- 8. Build batchUpdate body ---
+    now_str = _now_str()
+    today_label = _today_label()
+    body_data: list[dict] = []
+
+    for upd in admin_updates:
+        row_idx = upd["row_idx"]
+        platform = upd["platform"]
+        main_values = [[
+            upd["followers"],
+            upd["total_videos"],
+            now_str,
+            upd["full_import_at"],
+            str(upd["new_count"]),
+            upd["status"],
+        ]]
+        if platform == "instagram":
+            split_values = [[upd["followers"], upd["total_videos"], "", ""]]
+        elif platform == "youtube":
+            split_values = [["", "", upd["followers"], upd["total_videos"]]]
+        else:
+            split_values = [["", "", "", ""]]
+
+        body_data.append({
+            "range": f"'{DEFAULT_PROJECT_ADMIN_SHEET}'!C{row_idx}:H{row_idx}",
+            "values": main_values,
+        })
+        body_data.append({
+            "range": f"'{DEFAULT_PROJECT_ADMIN_SHEET}'!I{row_idx}:I{row_idx}",
+            "values": [[today_label]],
+        })
+        body_data.append({
+            "range": f"'{DEFAULT_PROJECT_ADMIN_SHEET}'!K{row_idx}:N{row_idx}",
+            "values": split_values,
+        })
+
+    if all_new_records:
+        next_row = _find_next_row_from_data(video_full_data)
+        end_row = next_row + len(all_new_records) - 1
+
+        def _rec_to_row(rec: ProjectVideoRecord) -> list:
+            return [
+                rec.published_at, rec.account_url, rec.platform_label,
+                rec.video_url, rec.caption, rec.first_comment,
+                rec.latest_comments, rec.hashtags, rec.mentions,
+                rec.child_posts, rec.comments, rec.likes, rec.play_views,
+                rec.raw_views, rec.duration_seconds,
+                "TRUE" if rec.recheck_enabled else "FALSE",
+                rec.day1_check, rec.month1_check, rec.imported_at,
+            ]
+
+        body_data.append({
+            "range": (
+                f"'{DEFAULT_PROJECT_VIDEOS_SHEET}'!A{next_row}:S{end_row}"
+            ),
+            "values": [_rec_to_row(r) for r in all_new_records],
+        })
+
+    snapshot_date = _today_full_date()
+    history_target_row: int | None = None
+    history_existing_row: list[str] | None = None
+    for offset, row in enumerate(history_data, start=HISTORY_DATA_START_ROW):
+        row_date = (row[0] if len(row) > 0 else "").strip()
+        if row_date == snapshot_date:
+            history_target_row = offset
+            history_existing_row = row
+            break
+
+    snapshot.date = snapshot_date
+    merged_history = snapshot.as_row(history_existing_row)
+    if history_target_row is None:
+        history_next_row = HISTORY_DATA_START_ROW + len(history_data)
+        body_data.append({
+            "range": (
+                f"'{DEFAULT_PROJECT_HISTORY_SHEET}'!A{history_next_row}:I{history_next_row}"
+            ),
+            "values": [merged_history],
+        })
+    else:
+        body_data.append({
+            "range": (
+                f"'{DEFAULT_PROJECT_HISTORY_SHEET}'!A{history_target_row}:I{history_target_row}"
+            ),
+            "values": [merged_history],
+        })
+
+    if has_main_sheet and summary_map:
+        bm_updates = prepare_main_sheet_bm_updates(
+            main_sheet_bl_bm_data, summary_map,
+            start_row=MAIN_SHEET_DATA_START_ROW,
+        )
+        for upd in bm_updates:
+            body_data.append({
+                "range": f"'{main_sheet_name}'!{upd['range']}",
+                "values": upd["values"],
+            })
+
+    # --- 9. batchUpdate ---
+    if body_data:
+        _sheet_call(
+            sh.values_batch_update,
+            {"valueInputOption": "USER_ENTERED", "data": body_data},
+        )
+
+    # --- 10. BM stats ---
+    bm_candidates = sum(
+        1 for row in main_sheet_bl_bm_data
+        if row and (row[0] if len(row) > 0 else "").strip()
+    )
+    bm_matched = 0
+    for row in main_sheet_bl_bm_data:
+        reel_url = (row[0] if len(row) > 0 else "") or ""
+        if not reel_url:
+            continue
+        platform = canonical_platform_name(detect_platform(reel_url))
+        if platform != "instagram":
+            continue
+        normalized_url = normalize_video_url(reel_url, platform)
+        if normalized_url in summary_map:
+            bm_matched += 1
+
+    return {
+        "client": client_name,
+        "enabled": True,
+        "accounts": len(accounts),
+        "new_videos": new_videos_total,
+        "statuses": statuses,
+        "inserted_by_platform": inserted_by_platform,
+        "skipped_platforms": skipped_platforms,
+        "incremental_support": incremental_support,
+        "rows_before": rows_before,
+        "rows_after": rows_before + new_videos_total,
+        "main_sheet_bm_candidates": bm_candidates,
+        "main_sheet_bm_matched": bm_matched,
+        "main_sheet_bm_updated": len(body_data) - len(admin_updates) * 3
+            - (1 if all_new_records else 0)
+            - (1 if history_data or True else 0),
+    }
 
 
 def fetch_youtube_video_snapshot(video_url: str) -> dict[str, Any] | None:
