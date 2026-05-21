@@ -100,7 +100,7 @@ async def _load_contexts(client_key: str | None = None) -> list[ClientContext]:
     return contexts
 
 
-async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRAM_MAX_APIFY_RUNS_PER_CYCLE) -> list[dict]:
+async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRAM_MAX_APIFY_RUNS_PER_CYCLE, platform_filter: str | None = None) -> list[dict]:
     contexts = await _load_contexts(client_key)
 
     instagram_accounts: list[tuple[str, int]] = []
@@ -108,6 +108,8 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
     facebook_accounts: list[tuple[str, int]] = []
     for ctx in contexts:
         for account in ctx.accounts:
+            if platform_filter and account.platform != platform_filter:
+                continue
             if account.platform == "instagram":
                 instagram_accounts.append((account.account_url, _fetch_limit(account)))
             elif account.platform == "tiktok":
@@ -163,6 +165,8 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
         snapshot = _empty_daily_snapshot()
 
         for account in ctx.accounts:
+            if platform_filter and account.platform != platform_filter:
+                continue
             try:
                 result = await sync_project_account(
                     ctx.admin_ws,
@@ -231,6 +235,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run one sync cycle and exit")
     parser.add_argument("--max-apify-runs", type=int, default=INSTAGRAM_MAX_APIFY_RUNS_PER_CYCLE, help="Max Instagram Apify runs per cycle")
     parser.add_argument("--test-limit", type=int, default=0, help="Limit videos fetched per account (for testing, e.g. --test-limit 3)")
+    parser.add_argument("--platform", help="Only sync this platform (e.g. tiktok, instagram, youtube)")
     args = parser.parse_args()
 
     if args.test_limit > 0:
@@ -249,9 +254,9 @@ def main():
         log.info("Test mode: fetch limit = %s per account", args.test_limit)
 
     if args.once:
-        asyncio.run(run_once(args.client, args.max_apify_runs))
+        asyncio.run(run_once(args.client, args.max_apify_runs, args.platform))
         return
-    asyncio.run(run_once(args.client, args.max_apify_runs))
+    asyncio.run(run_once(args.client, args.max_apify_runs, args.platform))
 
 
 if __name__ == "__main__":
