@@ -660,10 +660,13 @@ async def fetch_instagram_accounts_batch(accounts: list[tuple[str, int]]) -> dic
         seen.add(normalized_url)
         unique_accounts.append((normalized_url, max(1, int(limit or INSTAGRAM_RESULTS_LIMIT))))
 
+    # Use the largest requested limit so all accounts get their needed results
     batch_limit = max(limit for _, limit in unique_accounts)
+    # For big differences in limits, fetch more and trim later; the actor
+    # returns all results up to resultsLimit, we group per-account below.
     payload = {
         "username": [account_url for account_url, _ in unique_accounts],
-        "resultsLimit": batch_limit,
+        "resultsLimit": batch_limit * len(unique_accounts),
         "skipPinnedPosts": True,
         "includeSharesCount": False,
         "includeTranscript": False,
@@ -741,6 +744,9 @@ async def fetch_tiktok_accounts_batch(accounts: list[tuple[str, int]]) -> dict[s
         unique_accounts.append((normalized_url, max(1, int(limit or TIKTOK_RESULTS_LIMIT))))
 
     batch_limit = max(limit for _, limit in unique_accounts)
+    # resultsPerPage is per-profile, so the max limit ensures every account
+    # gets at least that many results. Accounts needing fewer are trimmed below.
+
     usernames = [_tiktok_profile_name(url) for url, _ in unique_accounts]
     usernames = [u for u in usernames if u]
     if not usernames:
@@ -2023,20 +2029,22 @@ async def sync_project_account(
         if normalize_video_url(url, "instagram")
     }
     if account.platform == "instagram":
-        payload = prefetched_instagram_payload if prefetched_instagram_payload is not None else await fetch_instagram_account(
-            account.account_url,
-            results_limit=limit,
-            extra_direct_urls=forced_video_urls,
-        )
+        if prefetched_instagram_payload is None:
+            raise ValueError(f"sync_project_account called for Instagram without prefetched data ({account.account_url})")
+        payload = prefetched_instagram_payload
         mapper = map_instagram_item
     elif account.platform == "youtube":
         payload = await fetch_youtube_account(account.account_url, results_limit=limit)
         mapper = map_youtube_item
     elif account.platform == "tiktok":
-        payload = prefetched_tiktok_payload if prefetched_tiktok_payload is not None else await fetch_tiktok_account(account.account_url, results_limit=limit)
+        if prefetched_tiktok_payload is None:
+            raise ValueError(f"sync_project_account called for TikTok without prefetched data ({account.account_url})")
+        payload = prefetched_tiktok_payload
         mapper = map_tiktok_item
     elif account.platform == "facebook":
-        payload = prefetched_facebook_payload if prefetched_facebook_payload is not None else await fetch_facebook_account(account.account_url, results_limit=limit)
+        if prefetched_facebook_payload is None:
+            raise ValueError(f"sync_project_account called for Facebook without prefetched data ({account.account_url})")
+        payload = prefetched_facebook_payload
         mapper = map_facebook_item
     elif account.platform == "vk":
         payload = await fetch_vk_account(account.account_url, results_limit=limit)
@@ -2094,7 +2102,22 @@ async def sync_project_account(
     }
 
 
-async def process_client_project_content(client_config: dict) -> dict[str, Any]:
+
+async def process_client_project_content(
+    client_config: dict,
+    prefetched_instagram: dict[str, dict] | None = None,
+    prefetched_tiktok: dict[str, dict] | None = None,
+    prefetched_facebook: dict[str, dict] | None = None,
+) -> dict[str, Any]:
+    """
+    Process a single client's project content using pre-fetched batch payloads.
+
+    This function no longer calls Apify directly — it expects already-fetched
+    batch data (from process_project_content_clients or run_once).
+
+    If prefetched_{platform} is None, accounts on that platform are skipped
+    (no per-account fallback to avoid accidental N+1 Apify calls).
+    """
     sh, admin_ws, videos_ws, history_ws = get_project_sheets(client_config)
     master_enabled, accounts = read_admin_rows(admin_ws)
     if not master_enabled:
@@ -2116,14 +2139,46 @@ async def process_client_project_content(client_config: dict) -> dict[str, Any]:
     skipped_platforms: dict[str, str] = {}
     incremental_support: dict[str, bool] = {}
     snapshot = _empty_daily_snapshot()
+
     for account in accounts:
         try:
+            insta_payload = None
+            tiktok_payload = None
+            fb_payload = None
+            if account.platform == "instagram":
+                if prefetched_instagram is None:
+                    log.warning("[%s] No prefetched Instagram data — skipping %s", client_config.get("name"), account.account_url)
+                    status = "SKIPPED: no prefetched data"
+                    update_admin_row(admin_ws, account, account.followers, account.total_videos, 0, status)
+                    statuses.append(f"{account.platform}:{status}")
+                    continue
+                insta_payload = prefetched_instagram.get(account.account_url)
+            elif account.platform == "tiktok":
+                if prefetched_tiktok is None:
+                    log.warning("[%s] No prefetched TikTok data — skipping %s", client_config.get("name"), account.account_url)
+                    status = "SKIPPED: no prefetched data"
+                    update_admin_row(admin_ws, account, account.followers, account.total_videos, 0, status)
+                    statuses.append(f"{account.platform}:{status}")
+                    continue
+                tiktok_payload = prefetched_tiktok.get(account.account_url)
+            elif account.platform == "facebook":
+                if prefetched_facebook is None:
+                    log.warning("[%s] No prefetched Facebook data — skipping %s", client_config.get("name"), account.account_url)
+                    status = "SKIPPED: no prefetched data"
+                    update_admin_row(admin_ws, account, account.followers, account.total_videos, 0, status)
+                    statuses.append(f"{account.platform}:{status}")
+                    continue
+                fb_payload = prefetched_facebook.get(account.account_url)
+
             result = await sync_project_account(
                 admin_ws,
                 videos_ws,
                 account,
                 existing_keys,
                 forced_video_urls=missing_main_sheet_instagram_urls if account.platform == "instagram" else None,
+                prefetched_instagram_payload=insta_payload,
+                prefetched_tiktok_payload=tiktok_payload,
+                prefetched_facebook_payload=fb_payload,
             )
             statuses.append(f"{result['platform']}:{result['status']}")
             new_videos += int(result.get("new") or 0)
@@ -2174,18 +2229,91 @@ async def process_client_project_content(client_config: dict) -> dict[str, Any]:
 
 
 async def process_project_content_clients(client_key: str | None = None) -> list[dict[str, Any]]:
-    results = []
+    """
+    Batched version of project content sync across all clients.
+
+    1. Load all clients with enabled project sync
+    2. Collect all accounts grouped by platform
+    3. Make batch Apify calls: 1 run for Instagram, 1 for TikTok, 1 for Facebook
+    4. Process each client with prefetched payloads
+    5. YouTube / VK / Rutube are processed per-account (native API, no Apify batch)
+    """
+
+    # Step 1: load all eligible clients
+    clients_data: list[tuple[dict, object, object, object, object, list]] = []
     for client in load_clients_config():
         if client_key and client.get("_key") != client_key:
             continue
         try:
-            result = await process_client_project_content(client)
-            results.append(result)
-        except Exception as e:
-            if DEFAULT_PROJECT_ADMIN_SHEET in str(e) or DEFAULT_PROJECT_VIDEOS_SHEET in str(e):
+            sh, admin_ws, videos_ws, history_ws = get_project_sheets(client)
+            master_enabled, accounts = read_admin_rows(admin_ws)
+            if not master_enabled:
+                log.info("[%s] project content sync skipped: B2 is off", client.get("name"))
+                continue
+            clients_data.append((client, sh, admin_ws, videos_ws, history_ws, accounts))
+        except Exception as exc:
+            if DEFAULT_PROJECT_ADMIN_SHEET in str(exc) or DEFAULT_PROJECT_VIDEOS_SHEET in str(exc):
                 log.info("[%s] project content sheets not configured, skip", client.get("name"))
                 continue
             raise
+
+    if not clients_data:
+        return []
+
+    # Step 2: collect accounts per platform across all clients
+    instagram_accounts: list[tuple[str, int]] = []
+    tiktok_accounts: list[tuple[str, int]] = []
+    facebook_accounts: list[tuple[str, int]] = []
+    for _client, _sh, _aw, _vw, _hw, accounts in clients_data:
+        for account in accounts:
+            limit = _fetch_limit(account)
+            if account.platform == "instagram":
+                instagram_accounts.append((account.account_url, limit))
+            elif account.platform == "tiktok":
+                tiktok_accounts.append((account.account_url, limit))
+            elif account.platform == "facebook":
+                facebook_accounts.append((account.account_url, limit))
+
+    # Step 3: batch-fetch each platform (1 Apify run per platform)
+    prefetched_instagram: dict[str, dict] = {}
+    if instagram_accounts:
+        log.info("Batch-fetching %s Instagram accounts across all clients", len(instagram_accounts))
+        try:
+            prefetched_instagram = await fetch_instagram_accounts_batch(instagram_accounts)
+        except Exception as exc:
+            log.warning("Instagram batch fetch failed: %s", exc)
+
+    prefetched_tiktok: dict[str, dict] = {}
+    if tiktok_accounts:
+        log.info("Batch-fetching %s TikTok accounts across all clients", len(tiktok_accounts))
+        try:
+            prefetched_tiktok = await fetch_tiktok_accounts_batch(tiktok_accounts)
+        except Exception as exc:
+            log.warning("TikTok batch fetch failed: %s", exc)
+
+    prefetched_facebook: dict[str, dict] = {}
+    if facebook_accounts:
+        log.info("Batch-fetching %s Facebook accounts across all clients", len(facebook_accounts))
+        try:
+            prefetched_facebook = await fetch_facebook_accounts_batch(facebook_accounts)
+        except Exception as exc:
+            log.warning("Facebook batch fetch failed: %s", exc)
+
+    # Step 4: process each client with prefetched data
+    results: list[dict[str, Any]] = []
+    for client, sh, admin_ws, videos_ws, history_ws, accounts in clients_data:
+        try:
+            result = await process_client_project_content(
+                client,
+                prefetched_instagram=prefetched_instagram,
+                prefetched_tiktok=prefetched_tiktok,
+                prefetched_facebook=prefetched_facebook,
+            )
+            results.append(result)
+        except Exception as exc:
+            log.exception("[%s] project content sync failed", client.get("name"))
+            results.append({"client": client.get("name"), "error": str(exc)[:200]})
+
     return results
 
 

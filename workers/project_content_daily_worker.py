@@ -41,7 +41,9 @@ from services.project_content_pipeline import (
     get_project_sheets,
     read_admin_rows,
     read_existing_video_keys,
+    read_missing_main_sheet_instagram_urls,
     sync_project_account,
+    sync_main_sheet_publication_metrics,
     update_admin_row,
     upsert_daily_snapshot,
     _empty_daily_snapshot,
@@ -156,6 +158,7 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
     results: list[dict] = []
     for ctx in contexts:
         existing_keys = read_existing_video_keys(ctx.videos_ws)
+        missing_main_sheet_instagram_urls = read_missing_main_sheet_instagram_urls(ctx.sh, ctx.client_config, existing_keys)
         rows_before = len(existing_keys)
         statuses: list[str] = []
         new_videos = 0
@@ -173,6 +176,7 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
                     ctx.videos_ws,
                     account,
                     existing_keys,
+                    forced_video_urls=missing_main_sheet_instagram_urls if account.platform == "instagram" else None,
                     prefetched_instagram_payload=prefetched_instagram.get(account.account_url) if account.platform == "instagram" else None,
                     prefetched_tiktok_payload=prefetched_tiktok.get(account.account_url) if account.platform == "tiktok" else None,
                     prefetched_facebook_payload=prefetched_facebook.get(account.account_url) if account.platform == "facebook" else None,
@@ -202,6 +206,7 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
                 log.exception("[%s] project sync failed for row %s: %s", ctx.client_config.get("name"), account.row_idx, exc)
 
         upsert_daily_snapshot(ctx.history_ws, snapshot)
+        bm_sync = sync_main_sheet_publication_metrics(ctx.sh, ctx.client_config, ctx.videos_ws)
         summary = {
             "client": ctx.client_config.get("name"),
             "enabled": True,
@@ -213,6 +218,9 @@ async def run_once(client_key: str | None = None, max_apify_runs: int = INSTAGRA
             "incremental_support": incremental_support,
             "rows_before": rows_before,
             "rows_after": rows_before + new_videos,
+            "main_sheet_bm_candidates": bm_sync.get("candidates", 0),
+            "main_sheet_bm_matched": bm_sync.get("matched", 0),
+            "main_sheet_bm_updated": bm_sync.get("updated", 0),
         }
         log.info(
             "[%s] accounts=%s new_videos=%s statuses=%s",
