@@ -665,16 +665,17 @@ async def fetch_instagram_accounts_batch(accounts: list[tuple[str, int]]) -> dic
         seen.add(normalized_url)
         unique_accounts.append((normalized_url, max(1, int(limit or INSTAGRAM_RESULTS_LIMIT))))
 
-    batch_limit = max(limit for _, limit in unique_accounts)
+    # Fetch only 1 post per account — enough to detect new videos.
+    fetch_per_account = 1
 
     log.info(
-        "Instagram single batch: limit=%s accounts=%s",
-        batch_limit, len(unique_accounts),
+        "Instagram single batch: fetch=%s/per-account accounts=%s",
+        fetch_per_account, len(unique_accounts),
     )
 
     payload = {
         "username": [url for url, _ in unique_accounts],
-        "resultsLimit": batch_limit * len(unique_accounts),
+        "resultsLimit": fetch_per_account * len(unique_accounts),
         "skipPinnedPosts": True,
         "includeSharesCount": False,
         "includeTranscript": False,
@@ -768,16 +769,20 @@ async def fetch_tiktok_accounts_batch(accounts: list[tuple[str, int]]) -> dict[s
     if not usernames:
         return {}
 
+    # Fetch only 1 post per profile — enough to detect new videos
+    # and get profile metadata. Keeps Apify billing minimal.
+    fetch_per_account = 1
+
     log.info(
-        "TikTok single batch: limit=%s accounts=%s profiles=%s",
-        batch_limit, len(unique_accounts), len(usernames),
+        "TikTok single batch: fetch=%s/per-profile accounts=%s profiles=%s",
+        fetch_per_account, len(unique_accounts), len(usernames),
     )
 
     apify_result = await _apify_run_with_meta(
         TIKTOK_APIFY_ACTOR_ID,
         {
             "profiles": usernames,
-            "resultsPerPage": batch_limit,
+            "resultsPerPage": fetch_per_account,
             "shouldDownloadVideos": False,
             "shouldDownloadCovers": False,
             "shouldDownloadSubtitles": False,
@@ -862,18 +867,19 @@ async def fetch_facebook_accounts_batch(accounts: list[tuple[str, int]]) -> dict
         seen.add(normalized_url)
         unique_accounts.append((normalized_url, max(1, int(limit or FACEBOOK_RESULTS_LIMIT))))
 
-    batch_limit = max(limit for _, limit in unique_accounts)
+    # Fetch only 1 post per account — enough for detection.
+    fetch_per_account = 1
 
     log.info(
-        "Facebook single batch: limit=%s accounts=%s",
-        batch_limit, len(unique_accounts),
+        "Facebook single batch: fetch=%s/per-account accounts=%s",
+        fetch_per_account, len(unique_accounts),
     )
 
     post_items = await _apify_run(
         FACEBOOK_POSTS_APIFY_ACTOR_ID,
         {
             "startUrls": [{"url": url} for url, _ in unique_accounts],
-            "resultsLimit": batch_limit * len(unique_accounts),
+            "resultsLimit": fetch_per_account * len(unique_accounts),
         },
     )
 
