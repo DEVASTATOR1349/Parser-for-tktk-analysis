@@ -1,28 +1,14 @@
-version: "3.9"
-
-# Mount your secrets into ./config/:
-#   ./config/service_account.json  — Google service account JSON
-#   ./config/clients.yaml          — clients config
-#
-# Server crontab example:
-#   0 6 * * *   cd /srv/parser && docker-compose run --rm daily-worker  >> logs/daily.log 2>&1
-#   */30 * * * * cd /srv/parser && docker-compose run --rm refresh-worker >> logs/refresh.log 2>&1
+version: '3.8'
 
 services:
-  daily-worker:
+  parser:
     build: .
-    env_file: .env
+    container_name: apify-parser
+    restart: unless-stopped
     volumes:
-      - ./config:/app/config:ro
-    entrypoint: ["python", "workers/project_content_daily_worker.py", "--once"]
-    command: []
-    restart: "no"
+      - ./logs:/app/logs
 
-  refresh-worker:
-    build: .
-    env_file: .env
-    volumes:
-      - ./config:/app/config:ro
-    entrypoint: ["python", "workers/video_refresh_worker.py", "--once"]
-    command: ["--max-rows", "50"]
-    restart: "no"
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Moscow

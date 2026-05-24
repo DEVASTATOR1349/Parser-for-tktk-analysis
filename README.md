@@ -1,43 +1,61 @@
-# Project Content Parser Handoff
+# apify-parser
+# Парсер подписчиков через Apify → Google Sheets
 
-Минимальный пакет алгоритма парсера клиентских аккаунтов.
+## Установка
 
-## Назначение
-
-Скрипт читает лист **«Админка проекта»** у клиента, парсит аккаунты/ролики по платформам и добавляет новые видео со статистикой в лист **«База Данных видео по проекту»**.
-
-## Состав
-
-- `workers/project_content_daily_worker.py` — точка запуска синка.
-- `services/project_content_pipeline.py` — основная логика парсинга, дедупликации и записи.
-- `examples/clients.example.yaml` — пример конфига клиента без реальных данных.
-- `examples/env.example` — пример переменных окружения без ключей.
+```bash
+cd /path/to/apify-parser
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Отредактируй .env — вставь токены
+```
 
 ## Запуск
 
 ```bash
-python3 workers/project_content_daily_worker.py --once
+# Разовый прогон
+source venv/bin/activate
+python src/main.py
+
+# Или через cron (см. crontab.example)
+crontab crontab.example
 ```
 
-Один клиент:
+## Логи
 
-```bash
-python3 workers/project_content_daily_worker.py --once --client demo_client
+Логи пишутся в `logs/parser_YYYY-MM-DD.log`. Авто-ротация раз в 30 дней.
+
+## Как это работает
+
+1. Читает Google Sheets — список проектов и ссылки на соцсети
+2. Для каждой ссылки определяет платформу
+3. Через Apify API запускает нужный актор
+4. Ждёт результат, извлекает количество подписчиков
+5. **Одним POST-запросом** пишет в листы "Статистика (raw)" и "Статистика"
+6. Ошибки пишет в лист "Ошибки" (тоже одним батчем)
+
+## Поддерживаемые платформы
+
+| Платформа | Apify актор | Статус |
+|---|---|---|
+| Instagram | apify/instagram-profile-scraper | ✅ |
+| YouTube | streamers/youtube-scraper | ✅ |
+| TikTok | clockworks/tiktok-profile-scraper | ✅ |
+| Facebook | apify/facebook-pages-scraper | ✅ |
+| Pinterest | easyapi/pinterest-profile-scraper | ✅ |
+| Дзен | apify/puppeteer-scraper | 🧪 тестовый |
+| VK | — | ❌ |
+| Telegram | — | ❌ |
+| OK | — | ❌ |
+| Rutube | — | ❌ |
+| Twitter/X | — | ❌ |
+| Snapchat | — | ❌ |
+| Likee | — | ❌ |
+
+## Лимиты
+
+- Макс 2 повторных запроса при ошибке
+- Задержка 1.5с между запросами
 ```
-
-## Что нужно настроить
-
-1. Google service account / OAuth доступ к таблицам.
-2. YouTube Data API key для YouTube.
-3. Apify token для Instagram, если используется Instagram-парсинг.
-4. `clients.yaml` по примеру из `examples/clients.example.yaml`.
-
-## Важно
-
-В репозитории нет:
-
-- реальных client spreadsheet IDs;
-- API-ключей;
-- баз данных;
-- дампов таблиц;
-- приватных runtime-файлов.
